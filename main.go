@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -159,16 +160,22 @@ func main() {
 		fps = 30
 	}
 	conf.period = time.Duration(int(1000/fps)) * time.Millisecond // ms
+	imgChan := make(chan []byte, 0)
+	// imgChan := make(chan gocv.Mat, 0)
+	wg := &sync.WaitGroup{}
 
 	defer func() {
 		stop()
+		close(imgChan)
 		fmt.Println("關閉影像")
 		cam.Close()
+		wg.Wait()
+		fmt.Println("結束程序")
 	}()
 
-	imgChan := make(chan []byte, 0)
-	// imgChan := make(chan gocv.Mat, 0)
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for img := range imgChan {
 			// buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
 			// if err != nil {
