@@ -166,19 +166,19 @@ func main() {
 		cam.Close()
 	}()
 
-	// imgChan := make(chan []byte, 0)
-	imgChan := make(chan gocv.Mat, 0)
+	imgChan := make(chan []byte, 0)
+	// imgChan := make(chan gocv.Mat, 0)
 	go func() {
-		for mat := range imgChan {
-			buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
-			if err != nil {
-				log.Println("影格編碼圖片失敗:", err)
-				continue
-			}
-			img := make([]byte, buf.Len(), buf.Len())
-			copy(img, buf.GetBytes())
-			buf.Close()
-			mat.Close()
+		for img := range imgChan {
+			// buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
+			// if err != nil {
+			// 	log.Println("影格編碼圖片失敗:", err)
+			// 	continue
+			// }
+			// img := make([]byte, buf.Len(), buf.Len())
+			// copy(img, buf.GetBytes())
+			// buf.Close()
+			// mat.Close()
 
 			if len(conf.Target) == 0 {
 				frame = img
@@ -245,18 +245,18 @@ func main() {
 			// 	return
 			// }
 
-			// buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
-			// if err != nil {
-			// 	log.Println("frame IMEncode error: ", err)
-			// 	return
-			// }
-			// img := make([]byte, buf.Len(), buf.Len())
-			// copy(img, buf.GetBytes())
-			// buf.Close()
+			buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
+			if err != nil {
+				log.Println("frame IMEncode error: ", err)
+				return
+			}
+			img := make([]byte, buf.Len(), buf.Len())
+			copy(img, buf.GetBytes())
+			buf.Close()
 
 			select {
-			// case imgChan <- img:
-			case imgChan <- mat.Clone():
+			case imgChan <- img:
+			// case imgChan <- mat.Clone():
 			case <-sigCtx.Done():
 				return
 			default:
