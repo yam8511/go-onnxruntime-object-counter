@@ -1,0 +1,10 @@
+{
+    "src": "0",
+    "target": [
+        "person"
+    ],
+    "conf_thres": 0.7,
+    "onnx": "yolov8n.onnx",
+    "names": "names.txt",
+    "onnx_lib": "D:/zero/earth-ae/lib/onnxruntime-win-x64-gpu-1.14.1/lib/onnxruntime.dll"
+}
