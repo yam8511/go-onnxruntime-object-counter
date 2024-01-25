@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -18,8 +20,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
-	ort "github.com/yam8511/go-onnxruntime"
 	"gocv.io/x/gocv"
+	"golang.org/x/sync/singleflight"
 )
 
 type Config struct {
@@ -41,13 +43,12 @@ type MatInfo struct {
 }
 
 var (
-	conf      Config
-	frame     []byte
-	frameMap      = &sync.Map{}
-	cancelMap     = &sync.Map{}
-	count     int = -1
-	sess      *Session_OD
-	// mx        = &sync.RWMutex{}
+	conf Config
+	// frameMap  = map[string][]byte{}
+	// frameLock = &sync.RWMutex{}
+	frameMap  = &sync.Map{}
+	cancelMap = &sync.Map{}
+	flight    = &singleflight.Group{}
 )
 
 func main() {
@@ -60,34 +61,6 @@ func main() {
 
 	err = json.Unmarshal(b, &conf)
 	must(err)
-
-	dllPath := ""
-	if runtime.GOOS == "windows" {
-		dllPath = "onnxruntime.dll"
-	}
-	if conf.OnnxLib != "" {
-		dllPath = conf.OnnxLib
-	}
-
-	if len(conf.Target) > 0 {
-		ortSDK, err := ort.New_ORT_SDK(func(opt *ort.OrtSdkOption) {
-			opt.Version = ort.ORT_API_VERSION
-			opt.WinDLL_Name = dllPath
-			opt.LoggingLevel = ort.ORT_LOGGING_LEVEL_WARNING
-		})
-		if err != nil {
-			log.Println("初始化 onnxruntime sdk 失敗: ", err)
-			return
-		}
-		defer ortSDK.Release()
-
-		sess, err = NewSession_OD(ortSDK, conf.Onnx, conf.Names, true)
-		if err != nil {
-			log.Println("初始化 onnxruntime sdk 失敗: ", err)
-			return
-		}
-		defer sess.release()
-	}
 
 	if conf.ConfThreshold == 0 {
 		conf.ConfThreshold = 0.6
@@ -138,232 +111,122 @@ func main() {
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		r := gin.Default()
-		r.GET("/", func(ctx *gin.Context) { ctx.String(200, "welcome person counter") })
-		r.POST("/api/open", func(ctx *gin.Context) {
-			var req struct {
-				Name string `json:"name"`
-				Src  string `json:"src"`
-			}
-			err := ctx.ShouldBindJSON(&req)
-			if err != nil {
-				ctx.JSON(200, err)
-				return
-			}
-
-			_, ok := cancelMap.Load(req.Name)
-			if ok {
-				ctx.JSON(200, "already opened")
-				return
-			}
-
-			camCtx, done := context.WithCancel(sigCtx)
-			cancelMap.Store(req.Name, done)
-			go runCamera(camCtx, req.Name, req.Src)
-			ctx.JSON(200, "ok")
-		})
-		r.POST("/api/close", func(ctx *gin.Context) {
-			var req struct {
-				Name string `json:"name"`
-			}
-			err := ctx.ShouldBindJSON(&req)
-			if err != nil {
-				ctx.JSON(200, err)
-				return
-			}
-
-			_done, ok := cancelMap.LoadAndDelete(req.Name)
-			if !ok {
-				ctx.JSON(200, "already closed")
-				return
-			}
-
-			done, ok := _done.(context.CancelFunc)
-			if !ok {
-				ctx.JSON(200, "already closed")
-				return
-			}
-			done()
-			ctx.JSON(200, "ok")
-		})
-		r.GET("/api/live", func(ctx *gin.Context) {
-			name := ctx.Query("name")
-			ctx.Header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-			ctx.Stream(func(w io.Writer) bool {
-				for {
-					select {
-					case <-ctx.Request.Context().Done():
-						return false
-					case <-sigCtx.Done():
-						return false
-					case <-time.After(conf.period):
-						var img []byte
-						if name == "" {
-							if len(frame) == 0 {
-								continue
-							}
-							img = frame
-						} else {
-							_frame, ok := frameMap.Load(name)
-							if !ok {
-								return false
-							}
-							img, ok = _frame.([]byte)
-							if !ok || len(img) == 0 {
-								continue
-							}
-						}
-						w.Write([]byte("--frame\r\n"))
-						w.Write([]byte("Content-Type: image/jpeg\r\n\r\n"))
-						// mx.RLock()
-						w.Write(img)
-						// mx.RUnlock()
-						w.Write([]byte("\r\n"))
-						return true
-					}
-				}
-			})
-		})
-		r.GET("/api/count", func(ctx *gin.Context) { ctx.JSON(200, count) })
-		port := 8000
-		if conf.Port > 0 {
-			port = conf.Port
+	r := gin.Default()
+	r.GET("/", func(ctx *gin.Context) { ctx.String(200, "welcome person counter") })
+	r.POST("/api/open", func(ctx *gin.Context) {
+		var req struct {
+			Name string `json:"name"`
+			Src  string `json:"src"`
 		}
-		r.Run(net.JoinHostPort("", strconv.Itoa(port)))
-	}()
+		err := ctx.ShouldBindJSON(&req)
+		if err != nil {
+			ctx.JSON(200, err)
+			return
+		}
 
-	cam, err := gocv.OpenVideoCapture(conf.Src)
-	must(err)
-	cam.Set(gocv.VideoCaptureBufferSize, 2)
-	fps := cam.Get(gocv.VideoCaptureFPS)
-	if fps == 0 {
-		fps = 30
+		_, ok := cancelMap.Load(req.Name)
+		if ok {
+			ctx.JSON(200, "already opened")
+			return
+		}
+
+		camCtx, done := context.WithCancel(sigCtx)
+		cancelMap.Store(req.Name, done)
+		// frameLock.Lock()
+		// frameMap[req.Name] = []byte{}
+		// frameLock.Unlock()
+		frameMap.Store(req.Name, []byte{})
+		go runCamera(camCtx, req.Name, req.Src)
+		ctx.JSON(200, "ok")
+	})
+	r.POST("/api/close", func(ctx *gin.Context) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		err := ctx.ShouldBindJSON(&req)
+		if err != nil {
+			ctx.JSON(200, err)
+			return
+		}
+
+		_done, ok := cancelMap.LoadAndDelete(req.Name)
+		if !ok {
+			ctx.JSON(200, "already closed")
+			return
+		}
+
+		done, ok := _done.(context.CancelFunc)
+		if !ok {
+			ctx.JSON(200, "already closed")
+			return
+		}
+		done()
+		ctx.JSON(200, "ok")
+	})
+	r.GET("/api/capture", func(ctx *gin.Context) {
+		name := ctx.Query("name")
+		img, ok := fetchImg(name)
+		if !ok {
+			ctx.JSON(200, "not open")
+			return
+		}
+		ctx.Data(200, "image/jpeg", img)
+	})
+	r.GET("/api/live", func(ctx *gin.Context) {
+		name := ctx.Query("name")
+		ctx.Header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+		ctx.Stream(func(w io.Writer) bool {
+			for {
+				select {
+				case <-ctx.Request.Context().Done():
+					return false
+				case <-sigCtx.Done():
+					return false
+				case <-time.After(conf.period):
+					img, ok := fetchImg(name)
+					if !ok {
+						return false
+					}
+					if len(img) == 0 {
+						continue
+					}
+					w.Write([]byte("--frame\r\n"))
+					w.Write([]byte("Content-Type: image/jpeg\r\n\r\n"))
+					// mx.RLock()
+					w.Write(img)
+					// mx.RUnlock()
+					w.Write([]byte("\r\n"))
+					return true
+				}
+			}
+		})
+	})
+	port := 8000
+	if conf.Port > 0 {
+		port = conf.Port
 	}
-	conf.period = time.Duration(int(1000/fps)) * time.Millisecond // ms
-	imgChan := make(chan MatInfo, 0)
-	// imgChan := make(chan gocv.Mat, 0)
-	wg := &sync.WaitGroup{}
+	server := &http.Server{
+		Addr:    net.JoinHostPort("", strconv.Itoa(port)),
+		Handler: r,
+	}
 
-	defer func() {
-		stop()
-		close(imgChan)
-		fmt.Println("關閉影像")
-		cam.Close()
-		wg.Wait()
-		fmt.Println("結束程序")
-	}()
-
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
-		for img := range imgChan {
-			func() {
-				mat, err := gocv.NewMatFromBytes(img.Row, img.Col, img.Type, img.Buf)
-				if err != nil {
-					log.Println("影格編碼圖片失敗:", err)
-					return
-				}
-				defer mat.Close()
-
-				if len(conf.Target) > 0 {
-					objects, err := sess.predict(mat, conf.ConfThreshold)
-					must(err)
-
-					targetObjects := []DetectObject{}
-					nextCount := 0
-					for _, v := range objects {
-						_, ok := conf.targetMap[v.Label]
-						if ok {
-							targetObjects = append(targetObjects, v)
-							nextCount++
-						}
-					}
-					count = nextCount
-					// mx.Lock()
-					if nextCount > 0 {
-						sess.drawBox(&mat, targetObjects)
-					}
-				}
-
-				buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
-				if err != nil {
-					log.Println("影格編碼圖片失敗:", err)
-					mat.Close()
-					return
-				}
-				img := make([]byte, buf.Len(), buf.Len())
-				copy(img, buf.GetBytes())
-				buf.Close()
-				frame = img
-				// mx.Unlock()
-			}()
+		err := server.ListenAndServe()
+		if err != nil {
+			log.Println("Listen error:", err)
 		}
+		stop()
 	}()
 
-	var now time.Time
-	mat := gocv.NewMat()
-	for {
-		if !cam.Read(&mat) {
-			cam.Close()
-			cam, err = gocv.OpenVideoCapture(conf.Src)
-			if err != nil {
-				log.Println("Open Camera error: ", err)
-				return
-			}
-			fps := cam.Get(gocv.VideoCaptureFPS)
-			if fps == 0 {
-				fps = 30
-			}
-			conf.period = time.Duration(int(1000/fps)) * time.Millisecond // ms
-		}
-		now = time.Now()
-		if !mat.Empty() {
-			// 儲存圖片
-			// gocv.IMWrite("origin.jpg", mat)
-			// b, err := os.ReadFile("origin.jpg")
-			// if err != nil {
-			// 	fmt.Printf("err: %v\n", err)
-			// 	return
-			// }
+	log.Println("Server runing", server.Addr)
 
-			// buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
-			// if err != nil {
-			// 	log.Println("frame IMEncode error: ", err)
-			// 	return
-			// }
-			// img := make([]byte, buf.Len(), buf.Len())
-			// copy(img, buf.GetBytes())
-			// buf.Close()
+	<-sigCtx.Done()
 
-			select {
-			case imgChan <- MatInfo{
-				Row:  mat.Rows(),
-				Col:  mat.Cols(),
-				Type: mat.Type(),
-				Buf:  mat.ToBytes(),
-			}:
-			// case imgChan <- mat.Clone():
-			case <-sigCtx.Done():
-				return
-			default:
-			}
-		}
-
-		dur := time.Since(now)
-		if dur < conf.period {
-			select {
-			case <-sigCtx.Done():
-				return
-			case <-time.After(conf.period - dur):
-			}
-		} else {
-			select {
-			case <-sigCtx.Done():
-				return
-			default:
-			}
-		}
+	err = server.Shutdown(sigCtx)
+	if err != nil {
+		log.Println("Server shutdown error:", err)
+	} else {
+		log.Println("Server shutdown")
 	}
 }
 
@@ -381,7 +244,7 @@ func runCamera(sigCtx context.Context, name, src string) {
 	if fps == 0 {
 		fps = 30
 	}
-	conf.period = time.Duration(int(1000/fps)) * time.Millisecond // ms
+	period := time.Duration(int(1000/fps)) * time.Millisecond // ms
 	imgChan := make(chan MatInfo, 0)
 	// imgChan := make(chan gocv.Mat, 0)
 	wg := &sync.WaitGroup{}
@@ -391,6 +254,9 @@ func runCamera(sigCtx context.Context, name, src string) {
 		fmt.Println("關閉影像")
 		cam.Close()
 		wg.Wait()
+		// frameLock.Lock()
+		// delete(frameMap, name)
+		// frameLock.Unlock()
 		frameMap.Delete(name)
 		cancelMap.Delete(name)
 		fmt.Println("結束程序")
@@ -408,25 +274,6 @@ func runCamera(sigCtx context.Context, name, src string) {
 				}
 				defer mat.Close()
 
-				if len(conf.Target) > 0 {
-					objects, err := sess.predict(mat, conf.ConfThreshold)
-					must(err)
-
-					targetObjects := []DetectObject{}
-					nextCount := 0
-					for _, v := range objects {
-						_, ok := conf.targetMap[v.Label]
-						if ok {
-							targetObjects = append(targetObjects, v)
-							nextCount++
-						}
-					}
-					// mx.Lock()
-					if nextCount > 0 {
-						sess.drawBox(&mat, targetObjects)
-					}
-				}
-
 				buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
 				if err != nil {
 					log.Println("影格編碼圖片失敗:", err)
@@ -436,8 +283,10 @@ func runCamera(sigCtx context.Context, name, src string) {
 				img := make([]byte, buf.Len(), buf.Len())
 				copy(img, buf.GetBytes())
 				buf.Close()
-				// mx.Unlock()
 				frameMap.Store(name, img)
+				// frameLock.Lock()
+				// frameMap[name] = img
+				// frameLock.Unlock()
 			}()
 		}
 	}()
@@ -456,7 +305,7 @@ func runCamera(sigCtx context.Context, name, src string) {
 			if fps == 0 {
 				fps = 30
 			}
-			conf.period = time.Duration(int(1000/fps)) * time.Millisecond // ms
+			period = time.Duration(int(1000/fps)) * time.Millisecond // ms
 		}
 		now = time.Now()
 		if !mat.Empty() {
@@ -492,11 +341,11 @@ func runCamera(sigCtx context.Context, name, src string) {
 		}
 
 		dur := time.Since(now)
-		if dur < conf.period {
+		if dur < period {
 			select {
 			case <-sigCtx.Done():
 				return
-			case <-time.After(conf.period - dur):
+			case <-time.After(period - dur):
 			}
 		} else {
 			select {
@@ -505,5 +354,25 @@ func runCamera(sigCtx context.Context, name, src string) {
 			default:
 			}
 		}
+
+		runtime.Gosched()
 	}
+}
+
+func fetchImg(name string) ([]byte, bool) {
+	_img, err, _ := flight.Do(name, func() (interface{}, error) {
+		// frameLock.RLock()
+		// img, ok := frameMap[name]
+		// frameLock.RUnlock()
+		_img, ok := frameMap.Load(name)
+		if !ok {
+			return nil, errors.New("")
+		}
+		return _img, nil
+	})
+	if err != nil {
+		return nil, false
+	}
+	img, _ := _img.([]byte)
+	return img, true
 }

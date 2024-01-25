@@ -5,8 +5,8 @@ go 1.20
 require (
 	github.com/gin-gonic/gin v1.9.1
 	github.com/samber/lo v1.38.1
-	github.com/yam8511/go-onnxruntime v1.1.0
 	gocv.io/x/gocv v0.33.0
+	golang.org/x/sync v0.6.0
 )
 
 require (
