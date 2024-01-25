@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,6 +23,7 @@ import (
 )
 
 type Config struct {
+	Port          int      `json:"port"`
 	Src           any      `json:"src"`
 	Onnx          string   `json:"onnx"`
 	OnnxLib       string   `json:"onnx_lib"`
@@ -30,6 +33,11 @@ type Config struct {
 	IouThreshold  float32  `json:"iou_thres"`
 	targetMap     map[string]int
 	period        time.Duration
+}
+type MatInfo struct {
+	Row, Col int
+	Type     gocv.MatType
+	Buf      []byte
 }
 
 var (
@@ -137,6 +145,9 @@ func main() {
 					case <-sigCtx.Done():
 						return false
 					case <-time.After(conf.period):
+						if len(frame) == 0 {
+							continue
+						}
 						w.Write([]byte("--frame\r\n"))
 						w.Write([]byte("Content-Type: image/jpeg\r\n\r\n"))
 						// mx.RLock()
@@ -149,7 +160,11 @@ func main() {
 			})
 		})
 		r.GET("/api/count", func(ctx *gin.Context) { ctx.JSON(200, count) })
-		r.Run(":8000")
+		port := 8000
+		if conf.Port > 0 {
+			port = conf.Port
+		}
+		r.Run(net.JoinHostPort("", strconv.Itoa(port)))
 	}()
 
 	cam, err := gocv.OpenVideoCapture(conf.Src)
@@ -160,7 +175,7 @@ func main() {
 		fps = 30
 	}
 	conf.period = time.Duration(int(1000/fps)) * time.Millisecond // ms
-	imgChan := make(chan []byte, 0)
+	imgChan := make(chan MatInfo, 0)
 	// imgChan := make(chan gocv.Mat, 0)
 	wg := &sync.WaitGroup{}
 
@@ -177,52 +192,46 @@ func main() {
 	go func() {
 		defer wg.Done()
 		for img := range imgChan {
-			// buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
-			// if err != nil {
-			// 	log.Println("影格編碼圖片失敗:", err)
-			// 	continue
-			// }
-			// img := make([]byte, buf.Len(), buf.Len())
-			// copy(img, buf.GetBytes())
-			// buf.Close()
-			// mat.Close()
+			func() {
+				mat, err := gocv.NewMatFromBytes(img.Row, img.Col, img.Type, img.Buf)
+				if err != nil {
+					log.Println("影格編碼圖片失敗:", err)
+					return
+				}
+				defer mat.Close()
 
-			if len(conf.Target) == 0 {
+				if len(conf.Target) > 0 {
+					objects, err := sess.predict(mat, conf.ConfThreshold)
+					must(err)
+
+					targetObjects := []DetectObject{}
+					nextCount := 0
+					for _, v := range objects {
+						_, ok := conf.targetMap[v.Label]
+						if ok {
+							targetObjects = append(targetObjects, v)
+							nextCount++
+						}
+					}
+					count = nextCount
+					// mx.Lock()
+					if nextCount > 0 {
+						sess.drawBox(&mat, targetObjects)
+					}
+				}
+
+				buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
+				if err != nil {
+					log.Println("影格編碼圖片失敗:", err)
+					mat.Close()
+					return
+				}
+				img := make([]byte, buf.Len(), buf.Len())
+				copy(img, buf.GetBytes())
+				buf.Close()
 				frame = img
-				continue
-			}
-
-			err = os.WriteFile("infer.jpg", img, os.ModePerm)
-			must(err)
-
-			objects, err := sess.predict("infer.jpg", conf.ConfThreshold)
-			must(err)
-
-			nextCount := 0
-			for _, v := range objects {
-				_, ok := conf.targetMap[v.Label]
-				if ok {
-					nextCount++
-				}
-			}
-			count = nextCount
-			// mx.Lock()
-			if nextCount > 0 {
-				frame2, err := os.ReadFile("result.jpg")
-				if err != nil {
-					fmt.Printf("err: %v\n", err)
-					return
-				}
-				frame = frame2
-			} else {
-				frame2, err := os.ReadFile("infer.jpg")
-				if err != nil {
-					fmt.Printf("err: %v\n", err)
-					return
-				}
-				frame = frame2
-			}
-			// mx.Unlock()
+				// mx.Unlock()
+			}()
 		}
 	}()
 
@@ -252,17 +261,22 @@ func main() {
 			// 	return
 			// }
 
-			buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
-			if err != nil {
-				log.Println("frame IMEncode error: ", err)
-				return
-			}
-			img := make([]byte, buf.Len(), buf.Len())
-			copy(img, buf.GetBytes())
-			buf.Close()
+			// buf, err := gocv.IMEncode(gocv.JPEGFileExt, mat)
+			// if err != nil {
+			// 	log.Println("frame IMEncode error: ", err)
+			// 	return
+			// }
+			// img := make([]byte, buf.Len(), buf.Len())
+			// copy(img, buf.GetBytes())
+			// buf.Close()
 
 			select {
-			case imgChan <- img:
+			case imgChan <- MatInfo{
+				Row:  mat.Rows(),
+				Col:  mat.Cols(),
+				Type: mat.Type(),
+				Buf:  mat.ToBytes(),
+			}:
 			// case imgChan <- mat.Clone():
 			case <-sigCtx.Done():
 				return

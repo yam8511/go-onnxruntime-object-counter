@@ -4,21 +4,20 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+
 	"math"
 	"os"
 	"strings"
-	"time"
 
 	ort "github.com/yam8511/go-onnxruntime"
-
 	"gocv.io/x/gocv"
 )
 
 type DetectObject struct {
-	Box     image.Rectangle
-	LabelID int
-	Label   string
-	Score   float32
+	ID    int
+	Label string
+	Score float32
+	Box   image.Rectangle
 }
 
 type Session_OD struct {
@@ -54,45 +53,32 @@ func NewSession_OD(ortSDK *ort.ORT_SDK, onnxFile, namesFile string, useGPU bool)
 	}, nil
 }
 
-func (sess *Session_OD) predict(inputFile string, threshold float32) (
+func (sess *Session_OD) predict_file(inputFile string, threshold float32) (
 	[]DetectObject, error,
 ) {
 	img := gocv.IMRead(inputFile, gocv.IMReadColor)
 	defer img.Close()
+	return sess.predict(img, threshold)
+}
 
-	var preP, inferP, postP time.Duration
-	now := time.Now()
+func (sess *Session_OD) predict(img gocv.Mat, threshold float32) (
+	[]DetectObject, error,
+) {
 	input, xFactor, yFactor, err := sess.prepare_input(img.Clone())
 	if err != nil {
 		return nil, err
 	}
-	preP = time.Since(now)
-
-	now = time.Now()
 	output, err := sess.run_model(input)
 	if err != nil {
 		return nil, err
 	}
-	inferP = time.Since(now)
 
-	now = time.Now()
-	objects := sess.process_output(output, threshold)
-	postP = time.Since(now)
+	objs := sess.process_output(output, threshold, xFactor, yFactor)
 
-	fmt.Printf(
-		"%s pre-process, %s inference, %s post-process, total %s\n",
-		preP, inferP, postP,
-		preP+inferP+postP,
-	)
+	return objs, nil
 
-	if len(objects) == 0 {
-		return objects, nil
-	}
-
-	sess.drawBox(&img, xFactor, yFactor, objects)
-	gocv.IMWrite("result.jpg", img)
-
-	return objects, nil
+	// sess.drawBox(&img, xFactor, yFactor, boxes, scores, classIds)
+	// gocv.IMWrite("result.jpg", img)
 }
 
 func (sess *Session_OD) prepare_input(img gocv.Mat) ([]float32, float32, float32, error) {
@@ -144,10 +130,9 @@ func (sess *Session_OD) run_model(input []float32) ([]float32, error) {
 	return outputTensor.GetData(), nil
 }
 
-func (sess *Session_OD) process_output(output []float32, threshold float32) (
-	objects []DetectObject,
+func (sess *Session_OD) process_output(output []float32, threshold, xFactor, yFactor float32) (
+	objs []DetectObject,
 ) {
-	objects = make([]DetectObject, 0)
 	output0, ok := sess.session.Output("output0")
 	if !ok {
 		return
@@ -200,49 +185,52 @@ func (sess *Session_OD) process_output(output []float32, threshold float32) (
 	}
 
 	indices := gocv.NMSBoxes(boxes, scores, threshold, 0.5)
+	objs = []DetectObject{}
 	for _, idx := range indices {
-		objects = append(objects, DetectObject{
-			Box:     boxes[idx],
-			LabelID: classIds[idx],
-			Label:   sess.names[classIds[idx]],
-			Score:   scores[idx],
+		box := image.Rect(
+			int(math.Round(float64(boxes[idx].Min.X)*float64(xFactor))),
+			int(math.Round(float64(boxes[idx].Min.Y)*float64(yFactor))),
+			int(math.Round(float64(boxes[idx].Max.X)*float64(xFactor))),
+			int(math.Round(float64(boxes[idx].Max.Y)*float64(yFactor))),
+		)
+		if box.Min.X < 0 {
+			box.Min.X = 0
+		}
+		if box.Min.Y < 0 {
+			box.Min.Y = 0
+		}
+		if box.Max.X < 0 {
+			box.Max.X = 0
+		}
+		if box.Max.Y < 0 {
+			box.Max.Y = 0
+		}
+		objs = append(objs, DetectObject{
+			ID:    classIds[idx],
+			Label: sess.names[classIds[idx]],
+			Score: scores[idx],
+			Box:   box,
 		})
 	}
+
 	return
 }
 
 func (sess *Session_OD) release() { sess.session.Release() }
 
 func (sess *Session_OD) drawBox(
-	img *gocv.Mat, xFactor, yFactor float32,
-	objects []DetectObject,
+	img *gocv.Mat,
+	objs []DetectObject,
 ) {
-	for _, object := range objects {
-		// if idx == 0 {
-		// 	continue
-		// }
-		// box := boxes[idx]
-		// fmt.Printf("######################: %v\n", idx)
-		// fmt.Printf("x1 = %v, y1 = %v\n", box.Min.X, box.Min.Y)
-		// fmt.Printf("x2 = %v, y2 = %v\n", box.Max.X, box.Max.Y)
-		// fmt.Printf("class id: %v\n", classIds[idx])
-		// box := boxes[idx]
-		box := object.Box
-		box = image.Rect(
-			int(math.Round(float64(box.Min.X)*float64(xFactor))),
-			int(math.Round(float64(box.Min.Y)*float64(yFactor))),
-			int(math.Round(float64(box.Max.X)*float64(xFactor))),
-			int(math.Round(float64(box.Max.Y)*float64(yFactor))),
-		)
+	for _, obj := range objs {
 		sess.draw_bounding_box(
 			img,
-			object.Label,
-			object.Score,
-			box,
-			color.RGBA{255, 0, 0, 0},
+			obj.Label,
+			obj.Score,
+			obj.Box,
+			color.RGBA{200, 200, 200, 0},
 			0, 0, 0,
 		)
-		// fmt.Println("==>", idx, ":", sess.names[classIds[idx]], scores[idx])
 	}
 }
 
