@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IP Camera Manager</title>
+</head>
+
+<body>
+    <div id="app">
+        <span style="cursor: pointer;  border-radius: 4px;background-color: lightgray; font-size:xx-large;"
+            @click="openCamera">開啟相機</span>
+        <br><br>
+        <div v-if="cameras.length > 0">
+            <select v-model="selectedCamera" @change="cameraOnChange()">
+                <option v-for="(camera, index) in cameras" :key="index" :value="camera">
+                    {{ camera ? camera : "空字串" }}
+                </option>
+            </select>
+            <button @click="capture(selectedCamera)">拍照</button>
+            <button @click="livePreview(selectedCamera)">即時預覽</button>
+            <button @click="closeCamera(selectedCamera)">關閉相機</button>
+            <hr>
+            <h3 v-if="imgSrc">{{imgLink}}</h3>
+            <img :src="imgSrc" style="max-width: 100%;" />
+        </div>
+    </div>
+
+
+
+
+    <script type="module">
+        import { createApp, ref, onMounted, computed } from 'https://unpkg.com/vue@3/dist/vue.esm-browser.js'
+
+        createApp({
+            setup() {
+                const cameras = ref([])
+                const selectedCamera = ref(null)
+                const imgSrc = ref('')
+                const imgLink = computed(() => window.location.origin + imgSrc.value)
+
+                onMounted(async () => {
+                    await refreshCamera()
+                })
+
+                const refreshCamera = async () => {
+                    const rest = await fetch('/api/list')
+                    cameras.value = await rest.json()
+                    checkSelect()
+                }
+
+                const checkSelect = () => {
+                    selectedCamera.value = selectedCamera.value == null && cameras.value.length > 0
+                        ? cameras.value[0] : selectedCamera.value
+                    cameraOnChange()
+                }
+
+                const openCamera = async () => {
+                    let name = prompt('相機名稱')
+                    if (name) {
+                        name = name.trim()
+                    }
+
+                    let src = prompt('相機網址 e.g. rtsp://x.x.x.x:554/live/stream')
+                    if (src) {
+                        src = src.trim()
+                    }
+                    if (!src) {
+                        alert(`未提供相機網址，忽略動作`)
+                        return
+                    }
+                    const rest = await fetch('/api/open', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                            name,
+                            src,
+                        })
+                    })
+                    alert(await rest.json())
+                    await refreshCamera()
+                }
+
+
+                const capture = async (name) => {
+                    imgSrc.value = `/api/capture?name=${name}&t=${Date.now()}`
+                }
+
+                const livePreview = async (name) => {
+                    imgSrc.value = `/api/live?name=${name}&t=${Date.now()}`
+                }
+
+                const closeCamera = async (name) => {
+                    const rest = await fetch('/api/close', {
+                        method: 'POST',
+                        body: JSON.stringify({ name })
+                    })
+                    alert(await rest.json())
+                    await refreshCamera()
+                }
+
+
+                const cameraOnChange = () => {
+                    imgSrc.value = ''
+                }
+
+                return {
+                    imgSrc,
+                    imgLink,
+                    cameras,
+                    selectedCamera,
+                    openCamera,
+                    capture,
+                    livePreview,
+                    closeCamera,
+                    cameraOnChange
+                }
+            }
+        }).mount('#app')
+    </script>
+</body>
+
+</html>

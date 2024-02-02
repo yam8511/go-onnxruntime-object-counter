@@ -1,0 +1,12 @@
+version: '3'
+
+services:
+  node:
+    image: gocv/opencv:4.8.1-ubuntu-22.04
+    tty: true
+    command: bash
+    working_dir: /work
+    ports:
+      - 8005:8005
+    volumes:
+      - .:/work
